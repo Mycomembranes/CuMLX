@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Darwin arm64e nvcc compatibility shim — CMake-compatible CUDA compiler driver.
+
+This driver implements an explicit, well-documented subset of the nvcc command
+line so that CMake's `enable_language(CUDA)` detection, the CUDAToolkit package,
+and a real cmake `--build` of a CUDA project (e.g. MLX's `mlx/backend/cuda`)
+work on macOS arm64 against the cuda-oxide "ported CUDA toolkit".
+
+Three behaviours:
+
+  1. `--version`           -> emit the NVIDIA banner (CMake IDs us as NVIDIA nvcc).
+  2. compiler-ID probe     -> when the input is CMake's `CMakeCUDACompilerId.cu`,
+                              produce an object whose strings carry the
+                              `INFO:compiler[NVIDIA]` / version markers CMake greps.
+  3. compile a TU `-c -o X.o`:
+       * host  .cpp/.cc/.cxx/.c  -> clang++ host object (flags forwarded/translated).
+       * device .cu              -> .cu -> PTX (clang CUDA frontend, device-only)
+                                    -> PTX -> cubin (cargo oxide precompile; falls
+                                    back to embedding raw PTX when ptxas/sp3 is
+                                    unreachable) -> wrap into a host Mach-O object
+                                    that self-registers the fatbin via the cudart
+                                    shim's __cudaRegisterFatBinary ABI.
+
+nvcc-only flags that clang cannot accept are SWALLOWED; clang-supported flags
+(`-I -D -O -std -MD -MT -MF -isystem -include -f...`) are FORWARDED.
+
+Env knobs:
+  NVCC_DARWIN_CLANG       clang++ to back the frontend (default llvm@21).
+  NVCC_DARWIN_ARCH        default device arch (default sm_120).
+  NVCC_DARWIN_VERSION     reported nvcc version (default 12.8.93).
+  NVCC_DARWIN_TRACE       if set, echo the underlying commands to stderr.
+  NVCC_DARWIN_RUNNER_HOST sp3-style runner for remote ptxas (default: none ->
+                          raw-PTX fallback, kernels JIT at load).
+  CUDA_OXIDE_BIN          path to the cargo-oxide binary (for `precompile`).
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+INCLUDE = ROOT / "include"
+CLANG = Path(os.environ.get("NVCC_DARWIN_CLANG", "/opt/homebrew/opt/llvm@21/bin/clang++"))
+DEFAULT_ARCH = os.environ.get("NVCC_DARWIN_ARCH", "sm_120")
+VERSION = os.environ.get("NVCC_DARWIN_VERSION", "12.8.93")
+RUNNER_HOST = os.environ.get("NVCC_DARWIN_RUNNER_HOST", "").strip()
+
+# Repo root (…/cuda-oxide-main) so we can find the cargo-oxide binary.
+REPO_ROOT = ROOT.parents[1]
+
+
+def trace(msg: str) -> None:
+    if os.environ.get("NVCC_DARWIN_TRACE"):
+        print(msg, file=sys.stderr)
+
+
+def emit_version() -> int:
+    rel = ".".join(VERSION.split(".")[:2])
+    print("nvcc: NVIDIA (R) Cuda compiler driver")
+    print("Copyright (c) 2005-2025 NVIDIA Corporation")
+    print(f"Cuda compilation tools, release {rel}, V{VERSION}")
+    print(f"Build cuda_{rel}.r{rel} (cuda-oxide nvcc-darwin-arm64e shim, {CLANG})")
+    return 0
+
+
+def usage() -> int:
+    print("nvcc Darwin arm64e shim (LLVM CUDA frontend, CMake-compatible)")
+    print("usage: nvcc [-arch=sm_120] [-O3] [-c] input.{cu,cpp} -o output")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+# nvcc-only flags that take NO value -> swallow.
+SWALLOW_NOARG = {
+    "--keep", "-keep",
+    "-rdc", "--device-c", "-dc", "-dlink",
+    "-forward-unknown-to-host-compiler",
+    "-Wno-deprecated-gpu-targets",
+    "--expt-relaxed-constexpr", "-expt-relaxed-constexpr",
+    "--extended-lambda", "-extended-lambda",
+    "--expt-extended-lambda",
+    "-default-stream", "--default-stream",
+    "--use_fast_math", "-use_fast_math",
+    "--resource-usage",
+    "-restrict",
+}
+
+# nvcc-only flags that take ONE value -> swallow flag + value.
+SWALLOW_ONEARG = {
+    "--keep-dir", "-keep-dir",
+    "-ccbin", "--compiler-bindir",
+    "--generate-code", "-gencode",
+    "-Xcudafe", "-Xfatbin", "-Xnvlink", "-Xptxas",
+    "-t", "--threads",
+    "--compress-mode",
+    "-code", "--gpu-code",
+    "--maxrregcount",
+}
+
+# flags whose VALUE is attached with '=' and should be swallowed entirely.
+SWALLOW_EQ_PREFIX = (
+    "--keep-dir=",
+    "--generate-code=", "-gencode=",
+    "--relocatable-device-code=", "-rdc=",
+    "--compiler-bindir=", "-ccbin=",
+    "-Xcudafe=", "-Xfatbin=", "-Xnvlink=", "-Xptxas=",
+    "--threads=",
+    "--compress-mode=",
+    "--default-stream=",
+    "--maxrregcount=",
+)
+
+
+class ParsedArgs:
+    def __init__(self) -> None:
+        self.inputs: list[str] = []        # source inputs
+        self.output: str | None = None
+        self.arch: str = DEFAULT_ARCH
+        self.compile_only = False          # -c present
+        self.preprocess_only = False       # -E present
+        self.dep_only = False              # -M / -MM
+        self.forward: list[str] = []       # clang-supported passthrough flags
+        self.xcompiler: list[str] = []     # -Xcompiler args -> host flags
+        self.lang_override: str | None = None  # from -x
+        self.verbose = False               # -v present
+
+
+def expand_options_file(path: str) -> list[str]:
+    try:
+        txt = Path(path).read_text()
+    except OSError:
+        return []
+    return shlex.split(txt)
+
+
+def parse(argv: list[str]) -> ParsedArgs:
+    # First expand any --options-file / -optf.
+    expanded: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in {"--options-file", "-optf"}:
+            i += 1
+            if i < len(argv):
+                expanded.extend(expand_options_file(argv[i]))
+        elif a.startswith("--options-file=") or a.startswith("-optf="):
+            expanded.extend(expand_options_file(a.split("=", 1)[1]))
+        else:
+            expanded.append(a)
+        i += 1
+    argv = expanded
+
+    p = ParsedArgs()
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+
+        # ---- arch ----
+        if a.startswith("-arch=") or a.startswith("--gpu-architecture="):
+            p.arch = a.split("=", 1)[1]
+        elif a in {"-arch", "--gpu-architecture"}:
+            i += 1
+            if i < n:
+                p.arch = argv[i]
+
+        # ---- output ----
+        elif a == "-o":
+            i += 1
+            if i < n:
+                p.output = argv[i]
+        elif a.startswith("-o") and len(a) > 2 and not a.startswith("-options"):
+            p.output = a[2:]
+
+        # ---- mode flags ----
+        elif a == "-v" or a == "--verbose":
+            p.verbose = True
+        elif a == "-c" or a == "--compile":
+            p.compile_only = True
+        elif a == "-E" or a == "--preprocess":
+            p.preprocess_only = True
+            p.forward.append("-E")
+        elif a in {"-M", "-MM"}:
+            p.dep_only = True
+            p.forward.append(a)
+
+        # ---- -x lang ----
+        elif a == "-x":
+            i += 1
+            if i < n:
+                p.lang_override = argv[i]
+        elif a.startswith("-x") and len(a) > 2:
+            p.lang_override = a[2:]
+
+        # ---- relocatable device code (with or without =value) ----
+        elif a.startswith("--relocatable-device-code") or a.startswith("-rdc"):
+            pass  # swallow, with or without value glued by '='
+
+        # ---- -Xcompiler -> forward to host ----
+        elif a.startswith("-Xcompiler="):
+            p.xcompiler.extend(shlex.split(a.split("=", 1)[1]))
+        elif a == "-Xcompiler":
+            i += 1
+            if i < n:
+                p.xcompiler.extend(shlex.split(argv[i]))
+
+        # ---- swallow nvcc-only with '=' value ----
+        elif any(a.startswith(pre) for pre in SWALLOW_EQ_PREFIX):
+            pass
+        # ---- swallow nvcc-only one-arg ----
+        elif a in SWALLOW_ONEARG:
+            i += 1  # also drop value
+        # ---- swallow nvcc-only no-arg ----
+        elif a in SWALLOW_NOARG:
+            pass
+
+        # ---- clang-forwardable flags ----
+        elif a in {"-MD", "-MMD", "-MP", "-MG"}:
+            p.forward.append(a)
+        elif a in {"-MT", "-MF", "-MQ", "-include", "-isystem", "-iquote"}:
+            p.forward.append(a)
+            i += 1
+            if i < n:
+                p.forward.append(argv[i])
+        elif a.startswith(("-I", "-D", "-U", "-O", "-std=", "-W", "-f", "-g",
+                           "-MT", "-MF", "-isystem", "-include", "-m")):
+            # most -f.../-W... are host/compiler flags clang understands; but a
+            # few nvcc -W spellings differ. Keep simple: forward.
+            p.forward.append(a)
+        elif a.startswith("-"):
+            # Unknown dash flag: be conservative and swallow (nvcc-only), trace it.
+            trace(f"nvcc-shim: swallowing unknown flag {a!r}")
+        else:
+            # positional -> input file
+            p.inputs.append(a)
+        i += 1
+
+    return p
+
+
+# --------------------------------------------------------------------------
+# Compiler-ID probe handling
+# --------------------------------------------------------------------------
+
+def is_compiler_id_probe(p: ParsedArgs) -> bool:
+    return any(Path(s).name == "CMakeCUDACompilerId.cu" for s in p.inputs)
+
+
+def emit_nvcc_verbose_dryrun(out_obj: str) -> None:
+    """Emit nvcc-style `#$` dry-run lines that CMake's
+    CMakeNVCCParseImplicitInfo.cmake greps to learn the implicit link line,
+    include dirs, and the cudart runtime default. We model a host-linker line
+    that references the produced object and links the cudart shim, so CMake can
+    extract: PATH, LIBRARIES (-> RUNTIME_LIBRARY_DEFAULT=SHARED via -lcudart),
+    INCLUDES, and the host link launcher (clang++)."""
+    cuda_lib = f"{CUDA_HOME}/lib"
+    cuda_inc = f"{CUDA_HOME}/include"
+    path = f"{ROOT}/bin:{os.environ.get('PATH','')}"
+    libraries = f"-L{cuda_lib} -lcudart -lcudadevrt"
+    includes = f'"-I{cuda_inc}"'
+    # CMake matches a link line that CONTAINS the LIBRARIES string. Build one.
+    link_line = (
+        f"{CLANG} -m64 {out_obj} -o a.out "
+        f"{libraries} -ldl -lpthread"
+    )
+    sys.stderr.write(
+        f"#$ PATH={path}\n"
+        f"#$ PATH={path}\n"
+        f"#$ LIBRARIES={libraries}\n"
+        f"#$ INCLUDES={includes}\n"
+        f"#$ SYSTEM_INCLUDES=\n"
+        f"#$ {link_line}\n"
+    )
+    sys.stderr.flush()
+
+
+CUDA_HOME = os.environ.get("CUDA_HOME") or os.environ.get(
+    "CUDAToolkit_ROOT", str(Path.home() / ".config/cuda-oxide/cuda-root"))
+
+
+def handle_compiler_id(p: ParsedArgs) -> int:
+    """CMake compiles CMakeCUDACompilerId.cu and greps the OBJECT for marker
+    strings (INFO:compiler[NVIDIA], INFO:compiler_version[...], etc). The .cu
+    defines those as `static const char info_compiler[] = "INFO:compiler[NVIDIA]"`.
+    We just need a real object that contains those strings. Compile the file as
+    plain C++ (host) with clang++; the macro-expanded string literals land in the
+    object's __cstring section, which is exactly what CMake greps."""
+    src = next(s for s in p.inputs if Path(s).name == "CMakeCUDACompilerId.cu")
+    out = p.output or "CMakeCUDACompilerId.o"
+    if p.verbose:
+        emit_nvcc_verbose_dryrun(out)
+    cmd = [
+        str(CLANG), "-c", "-x", "c++", "-std=c++17",
+        # Provide the version so the embedded INFO:compiler_version macro resolves.
+        f"-D__CUDACC_VER_MAJOR__={VERSION.split('.')[0]}",
+        f"-D__CUDACC_VER_MINOR__={VERSION.split('.')[1]}",
+        f"-D__CUDACC_VER_BUILD__={VERSION.split('.')[2]}",
+        "-D__CUDACC__=1", "-D__NVCC__=1",
+        src, "-o", out,
+    ]
+    trace("+ " + " ".join(cmd))
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        # Fall back: synthesize a minimal object carrying the marker strings so
+        # CMake's grep still succeeds even if the probe .cu uses constructs the
+        # host frontend rejects.
+        return synth_id_object(out)
+    return 0
+
+
+def synth_id_object(out: str) -> int:
+    marker = (
+        '#define I(x) const char info_##x[] = "INFO:" #x\n'
+        'const char info_compiler[] = "INFO:compiler[NVIDIA]";\n'
+        f'const char info_version[] = "INFO:compiler_version[{VERSION}]";\n'
+        'const char info_simulate[] = "INFO:simulate[]";\n'
+        'const char info_platform[] = "INFO:platform[Darwin]";\n'
+        'const char info_arch[] = "INFO:arch[]";\n'
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+        f.write(marker)
+        tmp = f.name
+    cmd = [str(CLANG), "-c", tmp, "-o", out]
+    trace("+ " + " ".join(cmd))
+    rc = subprocess.call(cmd)
+    os.unlink(tmp)
+    return rc
+
+
+# --------------------------------------------------------------------------
+# Host TU compile
+# --------------------------------------------------------------------------
+
+HOST_EXT = {".cpp", ".cc", ".cxx", ".c++", ".C"}
+DEVICE_EXT = {".cu"}
+
+
+def host_lang(path: str) -> str:
+    return "c" if path.endswith(".c") else "c++"
+
+
+def compile_host(p: ParsedArgs, src: str) -> int:
+    out = p.output or (Path(src).stem + ".o")
+    cmd = [str(CLANG)]
+    if p.compile_only:
+        cmd.append("-c")
+    if not p.preprocess_only and "-std=" not in " ".join(p.forward):
+        cmd.append("-std=c++17")
+    cmd += ["-x", host_lang(src)]
+    cmd += ["-I", str(INCLUDE)]
+    # NOTE: MLX's host .cpp TUs are compiled by CMAKE_CXX_COMPILER (Apple clang),
+    # NOT this shim — the host-side header needs (minimal cuda_fp16.h/cuda_fp8.h
+    # shims + the cccl sem_timedwait patch) are delivered via the toolkit root +
+    # apply-mlx-patches.sh, not here. `-I INCLUDE` already covers them if the shim
+    # is ever asked to compile a host .cpp directly.
+    cmd += p.forward
+    cmd += p.xcompiler
+    # MLX host TUs include cuda headers + expect MLX_USE_CUDA etc (passed via -D).
+    cmd += [src]
+    if p.output:
+        cmd += ["-o", out]
+    trace("+ " + " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+# --------------------------------------------------------------------------
+# Device TU compile:  .cu -> PTX -> cubin -> registering host object
+# --------------------------------------------------------------------------
+
+def cu_to_ptx(p: ParsedArgs, src: str, ptx_out: str) -> int:
+    # Compile device .cu against the REAL CUDA device header tree (the staged
+    # cuda_nvcc+cudart+curand+cccl redist) rather than the link-surface shim
+    # headers, so cooperative_groups / CCCL / CUTLASS device code compiles to PTX.
+    # Two macOS-vs-CCCL guards make it portable to Apple libc++ + the macOS SDK:
+    #   _LIBCUDACXX_STRING_H_HAS_CONST_OVERLOADS — libc++ already provides the
+    #     const libc string overloads, so skip CCCL's __host__ __device__ duplicates
+    #     (else "preferred overload" clash on strchr/strrchr/memchr/...).
+    #   NDEBUG — macOS <assert.h> expands assert() to host-only __assert_rtn, which
+    #     is not __device__-callable (Linux uses __assert_fail, which CUDA provides).
+    cuda_path = os.environ.get(
+        "CUDA_OXIDE_CROSS_CUDA_ROOT",
+        str(Path.home() / ".config/cuda-oxide/cuda-redist"))
+    cmd = [
+        str(CLANG),
+        "-x", "cuda",
+        "-std=c++17",
+        f"--cuda-path={cuda_path}",
+        f"--cuda-gpu-arch={p.arch}",
+        "--cuda-device-only",
+        "-S",
+        "-Wno-unknown-cuda-version",
+        "-D_LIBCUDACXX_STRING_H_HAS_CONST_OVERLOADS",
+        "-DNDEBUG",
+        # On macOS-arm64 the device frontend still inherits the host triple's ARM
+        # feature macros, so MLX's mlx/types/half_types.h takes its NATIVE ARM
+        # path (`using ::float16_t` from <arm_fp16.h>) and emits functions with
+        # `__fp16`/`__bf16` parameters — illegal for an NVPTX device target
+        # ("parameters cannot have __fp16 type"). A real Linux+nvcc build never
+        # sees these macros, so it uses MLX's portable _MLX_Float16/_MLX_BFloat16
+        # struct path. Undefine them so the device compile takes that same path.
+        "-U__ARM_FEATURE_FP16_SCALAR_ARITHMETIC",
+        "-U__ARM_FEATURE_BF16",
+        # Supply the long-double math device overloads clang-CUDA omits (see header).
+        "-include", str(INCLUDE / "mlx_device_compat.h"),
+    ]
+    # For DEVICE compilation the redist (--cuda-path) is the authoritative CUDA
+    # header tree. CMake's find_package(CUDAToolkit) injects
+    #   -isystem <CUDA_HOME>/include   (= cuda-root/include)
+    # which is the LINK-SURFACE shim (cuda.h -> cuda_driverkit.h; cuda_runtime_api.h
+    # -> the cudart stub). Those shadow/clash with the real device headers:
+    #   "cuda.h did not define CUDA_VERSION" + redefinition of cudaError/cudaUUID_t/...
+    # So drop any include flag that points at the cuda-root toolkit include dir
+    # (keep MLX's own -I cccl-src / cutlass-src / mlx source, etc).
+    # Device .cu sometimes #include host library headers (cublasLt.h / cufftXt.h /
+    # cudnn.h) that live only in the mathlib-stubs include dir, not the redist.
+    # Add it at LOWEST priority (-idirafter) so the redist device headers still
+    # win; this dir has NO cuda.h / cuda_runtime.h, so there is no device clash.
+    _stub_inc = REPO_ROOT / "portkit" / "cuda-mathlib-stubs" / "include"
+    if _stub_inc.is_dir():
+        cmd += ["-idirafter", str(_stub_inc)]
+    cmd += _filter_toolkit_includes(p.forward)
+    cmd += p.xcompiler
+    cmd += [src, "-o", ptx_out]
+    trace("+ " + " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+# Include dirs that must NOT shadow the real device header tree (--cuda-path).
+# These hold the link-surface shim cuda.h / cuda_runtime_api.h, which collide with
+# the redist's full device headers when compiling .cu device code.
+_TOOLKIT_INCLUDE_DIRS = {
+    str((Path(CUDA_HOME) / "include").resolve()),
+    str(INCLUDE.resolve()),
+}
+
+
+def _filter_toolkit_includes(flags: list[str]) -> list[str]:
+    """Strip `-I<dir>` / `-isystem <dir>` (both spellings) when <dir> is a
+    cuda-oxide link-surface toolkit include dir, so only --cuda-path supplies the
+    CUDA device headers. MLX's own include dirs pass through untouched."""
+    out: list[str] = []
+    i = 0
+    n = len(flags)
+
+    def _is_toolkit(d: str) -> bool:
+        try:
+            return str(Path(d).resolve()) in _TOOLKIT_INCLUDE_DIRS
+        except OSError:
+            return d in _TOOLKIT_INCLUDE_DIRS
+
+    while i < n:
+        a = flags[i]
+        if a == "-isystem" or a == "-I":
+            if i + 1 < n and _is_toolkit(flags[i + 1]):
+                i += 2
+                continue
+            out.append(a)
+            if i + 1 < n:
+                out.append(flags[i + 1])
+            i += 2
+            continue
+        if a.startswith("-I") and len(a) > 2:
+            if _is_toolkit(a[2:]):
+                i += 1
+                continue
+        if a.startswith("-isystem") and len(a) > len("-isystem"):
+            if _is_toolkit(a[len("-isystem"):]):
+                i += 1
+                continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def find_cargo_oxide() -> Path | None:
+    env = os.environ.get("CUDA_OXIDE_BIN")
+    if env and Path(env).exists():
+        return Path(env)
+    cand = REPO_ROOT / "target" / "release" / "cargo-oxide"
+    if cand.exists():
+        return cand
+    return None
+
+
+def ptx_to_cubin(ptx: str, arch: str, out_dir: str) -> str | None:
+    """Returns path to cubin, or None if ptxas/runner unavailable."""
+    co = find_cargo_oxide()
+    if co is None:
+        return None
+    cmd = [str(co), "precompile", ptx, "--arch", arch, "--out-dir", out_dir]
+    if RUNNER_HOST:
+        cmd += ["--runner-host", RUNNER_HOST]
+    trace("+ " + " ".join(cmd))
+    try:
+        rc = subprocess.call(cmd)
+    except OSError:
+        return None
+    if rc != 0:
+        return None
+    cubins = sorted(Path(out_dir).glob("*.cubin"))
+    return str(cubins[-1]) if cubins else None
+
+
+def c_byte_array(name: str, data: bytes) -> str:
+    body = ",".join(str(b) for b in data)
+    return (
+        f"const unsigned char {name}[] = {{{body}}};\n"
+        f"const unsigned long {name}_len = {len(data)}ul;\n"
+    )
+
+
+def make_fatbin_object(p: ParsedArgs, src: str, payload: bytes,
+                       payload_kind: str, out: str) -> int:
+    """Compile a small host C++ TU that embeds the device payload (cubin or PTX)
+    and self-registers it via the cudart shim's fatbin ABI at static-init time.
+    The registration calls are weakly declared so that if the cudart shim lacks
+    them the object still links (the symbols resolve against the shim)."""
+    sym = "mlx_dev_" + "".join(ch if ch.isalnum() else "_" for ch in Path(src).stem)
+    blob = c_byte_array(sym + "_data", payload)
+    tu = f"""// auto-generated by nvcc-darwin shim for {src}  (kind={payload_kind})
+extern "C" {{
+{blob}
+// CUDA fatbin wrapper header (magic 0x466243b1) — cudart consumes via
+// __cudaRegisterFatBinary. We register the raw payload; the runtime/driver
+// loads it through cuModuleLoadData (cubin) or JITs it (PTX).
+struct __fatBinC_Wrapper_t {{ int magic; int version; const void* data; void* filename; }};
+static const __fatBinC_Wrapper_t {sym}_wrap = {{
+    0x466243b1, 1, (const void*){sym}_data, 0 }};
+
+// Weak so an incomplete cudart shim still links.
+void** __cudaRegisterFatBinary(void*) __attribute__((weak));
+void __cudaRegisterFatBinaryEnd(void**) __attribute__((weak));
+
+static void** {sym}_handle = 0;
+__attribute__((constructor)) static void {sym}_register(void) {{
+    if (&__cudaRegisterFatBinary) {{
+        {sym}_handle = __cudaRegisterFatBinary((void*)&{sym}_wrap);
+        if (&__cudaRegisterFatBinaryEnd && {sym}_handle)
+            __cudaRegisterFatBinaryEnd({sym}_handle);
+    }}
+}}
+}} // extern C
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
+        f.write(tu)
+        tmp = f.name
+    cmd = [str(CLANG), "-c", "-std=c++17", tmp, "-o", out]
+    trace("+ " + " ".join(cmd))
+    rc = subprocess.call(cmd)
+    os.unlink(tmp)
+    return rc
+
+
+def cu_to_host_obj(p: ParsedArgs, src: str, out: str) -> int:
+    """Compile the HOST side of a .cu (`--cuda-host-only`, no ptxas needed) to an
+    object carrying the MLX host-callable symbols — the kernel launch wrappers +
+    host-side template instantiations that the `.cpp` TUs reference. Without this
+    the `.cu.o` would be device-fatbin-only and `libmlx` would have thousands of
+    undefined `mlx::` refs. Mirrors cu_to_ptx's header environment so the mangled
+    names match the `.cpp` side (cudaStream_t -> CUstream_st*, __half -> __half,
+    etc. mangle identically regardless of the underlying definition)."""
+    cuda_path = os.environ.get(
+        "CUDA_OXIDE_CROSS_CUDA_ROOT",
+        str(Path.home() / ".config/cuda-oxide/cuda-redist"))
+    cmd = [
+        str(CLANG), "-x", "cuda", "-std=c++17", f"--cuda-path={cuda_path}",
+        f"--cuda-gpu-arch={p.arch}", "--cuda-host-only", "-c",
+        "-Wno-unknown-cuda-version", "-D_LIBCUDACXX_STRING_H_HAS_CONST_OVERLOADS",
+        "-DNDEBUG", "-U__ARM_FEATURE_FP16_SCALAR_ARITHMETIC", "-U__ARM_FEATURE_BF16",
+        "-include", str(INCLUDE / "mlx_device_compat.h"),
+    ]
+    _stub_inc = REPO_ROOT / "portkit" / "cuda-mathlib-stubs" / "include"
+    if _stub_inc.is_dir():
+        cmd += ["-idirafter", str(_stub_inc)]
+    cmd += _filter_toolkit_includes(p.forward)
+    cmd += p.xcompiler
+    cmd += [src, "-o", out]
+    trace("+ " + " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+def compile_device(p: ParsedArgs, src: str) -> int:
+    """Emit the `.cu.o` ninja expects. The OBJECT is the HOST side of the .cu
+    (`--cuda-host-only`) — it carries the mlx:: host-callable symbols (launch
+    wrappers + host template instantiations) that the `.cpp` TUs reference, so
+    `libmlx` LINKS (a device-fatbin-only object leaves ~1783 undefined mlx:: refs).
+    MLX launches via the driver API + JITs/loads its device code separately, so
+    the host object is sufficient; the device `.cu -> PTX` path is independently
+    proven and emitted here only as a best-effort sidecar `<out>.ptx` (kernels are
+    not executed on macOS — sp3 is canonical for bit-exact compute)."""
+    out = p.output or (Path(src).stem + ".o")
+    rc = cu_to_host_obj(p, src, out)
+    if rc != 0:
+        return rc
+    # Best-effort device PTX sidecar (never fails the TU; skip via env if undesired).
+    if not os.environ.get("NVCC_DARWIN_SKIP_PTX_SIDECAR"):
+        try:
+            cu_to_ptx(p, src, out + ".ptx")
+        except Exception as exc:  # noqa: BLE001
+            trace(f"nvcc-shim: PTX sidecar skipped for {src}: {exc}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv:
+        return usage()
+    if "--version" in argv or "-V" in argv:
+        return emit_version()
+    if "-h" in argv or "--help" in argv:
+        return usage()
+
+    if not CLANG.exists():
+        print(f"nvcc shim: clang not found at {CLANG}", file=sys.stderr)
+        print("Install with: brew install llvm@21", file=sys.stderr)
+        return 127
+
+    p = parse(argv)
+
+    # CMake compiler-ID probe.
+    if is_compiler_id_probe(p):
+        return handle_compiler_id(p)
+
+    # Preprocess / dep-only / no compile: run the appropriate frontend straight.
+    if not p.inputs:
+        # e.g. a bare link or query invocation we don't model -> succeed quietly.
+        trace("nvcc-shim: no inputs; no-op success")
+        return 0
+
+    # Pick the (first) input; CMake compiles one TU per invocation.
+    src = p.inputs[0]
+    ext = "." + src.rsplit(".", 1)[-1] if "." in src else ""
+
+    lang = p.lang_override
+    if lang in {"cu", "cuda"}:
+        ext = ".cu"
+    elif lang in {"c++", "cpp"}:
+        ext = ".cpp"
+
+    if p.preprocess_only or p.dep_only:
+        # Preprocess/deps: treat .cu as cuda but device-only frontend; for host
+        # files just clang. Use device frontend for .cu so cuda builtins resolve.
+        if ext in DEVICE_EXT:
+            return cu_to_ptx(p, src, p.output or "/dev/null") if False else \
+                _preprocess(p, src, cuda=True)
+        return _preprocess(p, src, cuda=False)
+
+    if ext in DEVICE_EXT:
+        return compile_device(p, src)
+    if ext in HOST_EXT or ext == ".c":
+        return compile_host(p, src)
+
+    # Unknown input -> try host.
+    return compile_host(p, src)
+
+
+def _preprocess(p: ParsedArgs, src: str, cuda: bool) -> int:
+    cmd = [str(CLANG)]
+    if cuda:
+        cmd += ["-x", "cuda", "-nocudainc", "-nocudalib",
+                "--cuda-device-only", f"--cuda-gpu-arch={p.arch}"]
+    else:
+        cmd += ["-x", host_lang(src)]
+    cmd += ["-std=c++17", "-I", str(INCLUDE)]
+    cmd += p.forward + p.xcompiler + [src]
+    if p.output:
+        cmd += ["-o", p.output]
+    trace("+ " + " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
