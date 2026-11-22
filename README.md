@@ -1,3 +1,8 @@
+SO, right now im doing a file dump and will need to reoganize later. some of these files are stubs, or have been audited. I'm pretty close to full implementation, and I will share my native loader/booter/runner that was inspired by Tinygrad :) 
+
+
+
+
 # cuda-macros
 
 Procedural macros for writing CUDA kernels in Rust. Provides `#[kernel]`, `#[device]`, `#[launch_bounds]`, `#[cluster_launch]`, `gpu_printf!`, `cuda_launch!`, and `cuda_launch_async!` -- the primary user-facing compilation and launch API for cuda-oxide.
