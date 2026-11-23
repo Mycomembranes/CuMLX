@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "cuda-adapter-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "arm64 adapter server: serves the CUDA Driver API (cuda-oxide.driver.v1) to stand-in libcuda forwarders and routes it to the exact-serve stack"
+
+[[bin]]
+name = "cuda_adapter_server"
+path = "src/main.rs"
+
+[lib]
+name = "cuda_adapter_server"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+rmpv = "1"
+libc = "0.2"
+
+
+cuda-driverkit = { path = "../../../crates/cuda-driverkit" }
