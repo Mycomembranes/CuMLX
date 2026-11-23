@@ -1,0 +1,17 @@
+[package]
+name = "nvjitlink-darwin-arm64e"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "macOS arm64e nvJitLink wrapper dylib for cuda-oxide"
+
+[lib]
+name = "nvjitlink_darwin_arm64e"
+crate-type = ["cdylib"]
+
+[dependencies]
+libloading = { workspace = true }
+thiserror = { workspace = true }
+once_cell = { workspace = true }
