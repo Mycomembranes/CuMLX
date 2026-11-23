@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Modified for macOS ARM64: native PTX -> SASS (portkit solution 105, Route B).
+# Standalone crate (own [workspace]) so the Linux workspace build never sees it.
+[package]
+name = "ptxas-native"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Native macOS arm64 ptxas: NVIDIA's Linux-aarch64 libnvptxcompiler_static.a loaded in-process"
+
+[workspace]
+
+[[bin]]
+name = "ptxas-darwin-arm64"
+path = "src/main.rs"
+
+[dependencies]
+binary-ko-loader = { path = "../binary-ko-loader" }
+
+[profile.release]
+opt-level = 3
+debug = 1

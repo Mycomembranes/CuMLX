@@ -1,0 +1,349 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// FP16 tensor-core matmul for Blackwell sm_120.
+//
+// C[MxN] (fp32) = A[MxK] (fp16, row-major) @ B[KxN] (fp16, row-major)
+//
+// First-pass design (simplicity-first):
+//   - One warp per CTA, computes a 16x8 output tile.
+//   - K-loop steps by 16, one mma.sync.m16n8k16.row.col.f32.f16.f16.f32 per step.
+//   - A staged in shared memory (16x16 fp16 = 512 B); B staged in shared (16x8 fp16 = 256 B).
+//   - Note: B is stored row-major in global but mma expects "col" layout for B fragment,
+//     so we stage B into shared via cooperative ld.global, then load with the canonical
+//     m16n8k16 B fragment pattern (which is a 16x8 column-major view: 4 fp16 per thread).
+//   - Grid: (ceil(N/8), ceil(M/16), 1), Block: (32,1,1).
+//
+// Fragment layouts for mma.m16n8k16 (CUDA PTX ISA 8.7 §9.7.13.4.13):
+//   A: each thread holds 4 .f16x2 = 8 fp16 (a row-major 16x16 tile).
+//      Quadrant (groupID, threadID_in_group): tid/4 = groupID (0..7), tid%4 = lane.
+//      Thread holds rows {groupID, groupID+8} cols {lane*2 .. lane*2+1, lane*2+8 .. lane*2+9}.
+//   B: each thread holds 2 .f16x2 = 4 fp16 (col-major view of 16x8 tile, i.e. 8 cols x 16 rows).
+//      Thread (tid) holds col=(tid%4)*2 ... but per PTX spec it's the column index of the K dim.
+//      Per spec: B fragment row-major-of-cols: col = tid/4, rows = (tid%4)*2..(tid%4)*2+1 and +8.
+//   D: each thread holds 4 .f32. Quadrant same as A: groupID=tid/4, lane=tid%4.
+//      D maps to output rows {groupID, groupID+8} cols {lane*2, lane*2+1}.
+//
+// Required params:
+//   .param .u64 A_ptr        // fp16 [M,K] row-major
+//   .param .u64 B_ptr        // fp16 [K,N] row-major
+//   .param .u64 C_ptr        // fp32 [M,N] row-major
+//   .param .u32 M
+//   .param .u32 N
+//   .param .u32 K
+//
+// CTA tile: one warp = one 16x8 output tile.
+//
+.version 8.7
+.target sm_120
+.address_size 64
+
+.shared .align 16 .b8 sA[512];   // 16*16*2 bytes
+.shared .align 16 .b8 sB[256];   // 16*8*2 bytes
+
+.visible .entry matmul_fp16_mma(
+    .param .u64 .ptr .align 1 A_ptr,
+    .param .u64 .ptr .align 1 B_ptr,
+    .param .u64 .ptr .align 1 C_ptr,
+    .param .u32 M_param,
+    .param .u32 N_param,
+    .param .u32 K_param
+)
+.maxntid 32
+{
+    .reg .pred  %p<8>;
+    .reg .b32   %r<80>;
+    .reg .b32   %a0, %a1, %a2, %a3;     // A fragment (4 x .b32 = 4 x f16x2)
+    .reg .b32   %b0, %b1;                // B fragment (2 x .b32 = 2 x f16x2)
+    .reg .f32   %d0, %d1, %d2, %d3;      // D/C accumulator
+    .reg .b64   %rd<32>;
+
+    ld.param.b64    %rd1, [A_ptr];
+    ld.param.b64    %rd2, [B_ptr];
+    ld.param.b64    %rd3, [C_ptr];
+    ld.param.b32    %r1,  [M_param];
+    ld.param.b32    %r2,  [N_param];
+    ld.param.b32    %r3,  [K_param];
+    cvta.to.global.u64  %rd1, %rd1;
+    cvta.to.global.u64  %rd2, %rd2;
+    cvta.to.global.u64  %rd3, %rd3;
+
+    // Block & thread identifiers
+    mov.u32     %r10, %ctaid.x;        // block_col (output N tile of 8)
+    mov.u32     %r11, %ctaid.y;        // block_row (output M tile of 16)
+    mov.u32     %r12, %tid.x;          // lane 0..31
+
+    // tile origin in C
+    shl.b32     %r13, %r10, 3;         // col0 = block_col * 8
+    shl.b32     %r14, %r11, 4;         // row0 = block_row * 16
+
+    // Initialize accumulators to 0
+    mov.f32     %d0, 0f00000000;
+    mov.f32     %d1, 0f00000000;
+    mov.f32     %d2, 0f00000000;
+    mov.f32     %d3, 0f00000000;
+
+    // K-loop: step by 16
+    mov.b32     %r20, 0;               // k = 0
+    setp.lt.s32 %p1, %r3, 16;
+    @%p1 bra    EPILOG;                // require K >= 16 for simplicity
+
+LOOP:
+    // ---- Stage A tile: 16 rows x 16 cols of fp16, row-major into sA ----
+    // 16*16 = 256 fp16. 32 threads → 8 fp16/thread. Use 4 ld.global.b32 (2 fp16 each)?
+    // Simpler: each thread stages 8 fp16 = 4 .b32 (8 bytes per b32 load? no, b32=4B=2 fp16).
+    // 256 fp16 / 32 threads = 8 fp16 = 4 b32 per thread. Each b32 = 2 fp16.
+    // Layout: thread tid loads bytes [tid*16 .. tid*16+15] of sA (8 fp16 contiguous).
+    // Source: A[row0 + (tid*8)/16, k + (tid*8)%16] ... tid*8 covers 256 elements linearly.
+    // Linearize: idx = tid*8 .. tid*8+7. row = row0 + idx/16. col = k + idx%16.
+    // We'll do 4 separate b32 loads (each is 2 fp16).
+    {
+        .reg .b32 idx0, row_i, col_i;
+        .reg .b64 a_off, a_addr;
+        .reg .b32 s_off;
+        // Per-thread base linear index into the 16x16 tile = tid*8
+        shl.b32     idx0, %r12, 3;     // tid*8
+
+        // s_off = byte offset into sA = idx0 * 2 (fp16 = 2 bytes)
+        shl.b32     s_off, idx0, 1;
+
+        // Four 2-fp16 chunks per thread: offsets 0,2,4,6 in fp16 = 0,4,8,12 in bytes
+        // For each chunk, compute global addr and load b32.
+        // Chunk c (c=0..3): linear = idx0 + c*2; row = linear/16; col = linear%16
+        // Since idx0 is a multiple of 8, idx0/16 = (tid/2), idx0%16 = (tid&1)*8.
+        // chunk 0: linear=idx0, row=(tid/2), col=(tid&1)*8+0
+        // chunk 1: linear=idx0+2, row=(tid/2), col=(tid&1)*8+2
+        // chunk 2: linear=idx0+4, row=(tid/2), col=(tid&1)*8+4
+        // chunk 3: linear=idx0+6, row=(tid/2), col=(tid&1)*8+6
+        // All four chunks share the same row. Good — single contiguous 16-byte load possible.
+        // We'll use ld.global.v4.b32 for 16-byte coalesced load.
+
+        .reg .b32 row, col_base;
+        shr.u32     row, %r12, 1;          // tid/2
+        and.b32     col_base, %r12, 1;
+        shl.b32     col_base, col_base, 3; // (tid&1)*8
+
+        add.s32     row, row, %r14;        // global row = row0 + row
+        add.s32     col_base, col_base, %r20; // global col = k + col_base
+
+        // Bounds: row < M, col_base+8 <= K (since K is multiple of 16 expected); guard row
+        setp.ge.s32 %p2, row, %r1;
+        // a_off (bytes) = (row * K + col_base) * 2
+        mad.lo.s32  %r30, row, %r3, col_base;
+        mul.wide.s32 a_off, %r30, 2;
+        add.s64     a_addr, %rd1, a_off;
+
+        .reg .v4 .b32 a_vec;
+        mov.b32     a_vec.x, 0;
+        mov.b32     a_vec.y, 0;
+        mov.b32     a_vec.z, 0;
+        mov.b32     a_vec.w, 0;
+        @!%p2 ld.global.v4.b32  a_vec, [a_addr];
+
+        // Store to sA at byte offset s_off (16 bytes per thread)
+        .reg .b64 sa_addr;
+        mov.b64     sa_addr, sA;
+        cvt.u64.u32 %rd10, s_off;
+        add.s64     sa_addr, sa_addr, %rd10;
+        st.shared.v4.b32 [sa_addr], a_vec;
+    }
+
+    // ---- Stage B tile: 16 rows x 8 cols of fp16 from B[k..k+16, col0..col0+8], row-major into sB ----
+    // 16*8 = 128 fp16. 32 threads → 4 fp16/thread = 2 b32 = 8 bytes per thread.
+    // Linearize: per-thread base = tid*4 (in fp16 units). row = (tid*4)/8 = tid/2. col = (tid&1)*4.
+    {
+        .reg .b32 row, col_base, s_off;
+        .reg .b64 b_off, b_addr, sb_addr, tmp64;
+
+        shr.u32     row, %r12, 1;       // tid/2 → row within tile 0..15
+        and.b32     col_base, %r12, 1;
+        shl.b32     col_base, col_base, 2; // (tid&1)*4
+
+        // global row = k + row (since rows of B are K dimension)
+        add.s32     row, row, %r20;
+        // global col = col0 + col_base
+        add.s32     col_base, col_base, %r13;
+
+        // b_off = (row * N + col_base) * 2
+        mad.lo.s32  %r31, row, %r2, col_base;
+        mul.wide.s32 b_off, %r31, 2;
+        add.s64     b_addr, %rd2, b_off;
+
+        .reg .v2 .b32 b_vec;
+        mov.b32     b_vec.x, 0;
+        mov.b32     b_vec.y, 0;
+        // Bounds guard: row < K
+        setp.ge.s32 %p3, row, %r3;
+        @!%p3 ld.global.v2.b32  b_vec, [b_addr];
+
+        // store at sB[tid*8] (8 bytes per thread)
+        shl.b32     s_off, %r12, 3;     // tid*8
+        mov.b64     sb_addr, sB;
+        cvt.u64.u32 tmp64, s_off;
+        add.s64     sb_addr, sb_addr, tmp64;
+        st.shared.v2.b32 [sb_addr], b_vec;
+    }
+
+    bar.sync 0;
+
+    // ---- Load A fragment from sA per mma.m16n8k16 row.col layout ----
+    // A is 16x16 fp16 row-major in sA. Per PTX spec for m16n8k16 .f16:
+    //   groupID = tid/4 (0..7), lane = tid%4 (0..3).
+    //   A fragment holds 4 .b32 (= 8 fp16):
+    //     a0 = sA[row=groupID,        cols=lane*2 .. lane*2+1]   (1 b32)
+    //     a1 = sA[row=groupID+8,      cols=lane*2 .. lane*2+1]
+    //     a2 = sA[row=groupID,        cols=lane*2+8 .. lane*2+9]
+    //     a3 = sA[row=groupID+8,      cols=lane*2+8 .. lane*2+9]
+    {
+        .reg .b32 groupID, lane;
+        .reg .b64 base, p_a0, p_a1, p_a2, p_a3, tmp;
+        .reg .b32 b_off0, b_off1, b_off2, b_off3;
+
+        shr.u32     groupID, %r12, 2;
+        and.b32     lane, %r12, 3;
+
+        // byte offset = (row*16 + col)*2; row stride=32 bytes
+        // a0: (groupID*16 + lane*2)*2 = groupID*32 + lane*4
+        // a1: (groupID+8)*32 + lane*4
+        // a2: groupID*32 + (lane*2+8)*2 = groupID*32 + lane*4 + 16
+        // a3: (groupID+8)*32 + lane*4 + 16
+        shl.b32     b_off0, groupID, 5;
+        shl.b32     %r40, lane, 2;
+        add.s32     b_off0, b_off0, %r40;
+        add.s32     b_off1, b_off0, 256;  // 8 rows * 32 bytes
+        add.s32     b_off2, b_off0, 16;
+        add.s32     b_off3, b_off1, 16;
+
+        mov.b64     base, sA;
+        cvt.u64.u32 tmp, b_off0; add.s64 p_a0, base, tmp;
+        cvt.u64.u32 tmp, b_off1; add.s64 p_a1, base, tmp;
+        cvt.u64.u32 tmp, b_off2; add.s64 p_a2, base, tmp;
+        cvt.u64.u32 tmp, b_off3; add.s64 p_a3, base, tmp;
+
+        ld.shared.b32 %a0, [p_a0];
+        ld.shared.b32 %a1, [p_a1];
+        ld.shared.b32 %a2, [p_a2];
+        ld.shared.b32 %a3, [p_a3];
+    }
+
+    // ---- Load B fragment from sB ----
+    // sB layout: 16 rows (K) x 8 cols (N), row-major, fp16 → row stride = 16 bytes.
+    // Per PTX m16n8k16 spec (.col layout for B): each thread holds 2 .b32 (4 fp16):
+    //   col = tid/4 (0..7), rows = (tid%4)*2 .. (tid%4)*2+1 and +8 .. +9.
+    //   b0 = {sB[row=(tid%4)*2,   col], sB[row=(tid%4)*2+1, col]}
+    //   b1 = {sB[row=(tid%4)*2+8, col], sB[row=(tid%4)*2+9, col]}
+    // But these are NOT contiguous in row-major sB. We need 4 fp16 loads → repack as 2 b32.
+    // Simpler approach: do 4 .b16 loads and assemble.
+    {
+        .reg .b32 col, rowq, rowq2;
+        .reg .b64 base, addr, tmp;
+        .reg .b16 h0, h1, h2, h3;
+
+        shr.u32     col, %r12, 2;
+        and.b32     rowq, %r12, 3;
+        shl.b32     rowq, rowq, 1;        // (tid%4)*2
+        add.s32     rowq2, rowq, 8;
+
+        mov.b64     base, sB;
+
+        // offset for (row, col) in bytes = (row*8 + col)*2 = row*16 + col*2
+        // h0: row=rowq,    col=col
+        .reg .b32 off;
+        shl.b32     off, rowq, 4;
+        mad.lo.s32  off, col, 2, off;
+        cvt.u64.u32 tmp, off;
+        add.s64     addr, base, tmp;
+        ld.shared.b16 h0, [addr];
+
+        // h1: row=rowq+1, col=col → off + 16
+        cvt.u64.u32 tmp, off;
+        add.s64     addr, base, tmp;
+        ld.shared.b16 h1, [addr+16];
+
+        // h2: row=rowq2, col=col
+        shl.b32     off, rowq2, 4;
+        mad.lo.s32  off, col, 2, off;
+        cvt.u64.u32 tmp, off;
+        add.s64     addr, base, tmp;
+        ld.shared.b16 h2, [addr];
+
+        // h3: row=rowq2+1, col=col → +16
+        ld.shared.b16 h3, [addr+16];
+
+        // Pack: b0 = {h0, h1} (low=h0, high=h1)
+        mov.b32     %b0, {h0, h1};
+        mov.b32     %b1, {h2, h3};
+    }
+
+    // ---- MMA ----
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%d0, %d1, %d2, %d3},
+        {%a0, %a1, %a2, %a3},
+        {%b0, %b1},
+        {%d0, %d1, %d2, %d3};
+
+    bar.sync 0;
+
+    // advance k
+    add.s32     %r20, %r20, 16;
+    setp.lt.s32 %p4, %r20, %r3;
+    @%p4 bra    LOOP;
+
+EPILOG:
+    // ---- Write D fragment to C[row0+..., col0+...] ----
+    // Per spec: groupID=tid/4 → rows {groupID, groupID+8}, lane=tid%4 → cols {lane*2, lane*2+1}.
+    //   d0 → C[row0+groupID,     col0+lane*2]
+    //   d1 → C[row0+groupID,     col0+lane*2+1]
+    //   d2 → C[row0+groupID+8,   col0+lane*2]
+    //   d3 → C[row0+groupID+8,   col0+lane*2+1]
+    {
+        .reg .b32 groupID, lane;
+        .reg .b32 r_top, r_bot, c_left, c_right;
+        .reg .b64 off, addr;
+        .reg .pred p_in;
+
+        shr.u32     groupID, %r12, 2;
+        and.b32     lane, %r12, 3;
+        add.s32     r_top, %r14, groupID;
+        add.s32     r_bot, r_top, 8;
+        shl.b32     lane, lane, 1;
+        add.s32     c_left, %r13, lane;
+        add.s32     c_right, c_left, 1;
+
+        // C[r_top, c_left] = d0
+        mad.lo.s32  %r50, r_top, %r2, c_left;
+        mul.wide.s32 off, %r50, 4;
+        add.s64     addr, %rd3, off;
+        setp.lt.s32 %p5, r_top, %r1;
+        setp.lt.s32 %p6, c_left, %r2;
+        and.pred    p_in, %p5, %p6;
+        @p_in st.global.b32 [addr], %d0;
+
+        // C[r_top, c_right] = d1
+        mad.lo.s32  %r50, r_top, %r2, c_right;
+        mul.wide.s32 off, %r50, 4;
+        add.s64     addr, %rd3, off;
+        setp.lt.s32 %p6, c_right, %r2;
+        and.pred    p_in, %p5, %p6;
+        @p_in st.global.b32 [addr], %d1;
+
+        // C[r_bot, c_left] = d2
+        setp.lt.s32 %p5, r_bot, %r1;
+        mad.lo.s32  %r50, r_bot, %r2, c_left;
+        mul.wide.s32 off, %r50, 4;
+        add.s64     addr, %rd3, off;
+        setp.lt.s32 %p6, c_left, %r2;
+        and.pred    p_in, %p5, %p6;
+        @p_in st.global.b32 [addr], %d2;
+
+        // C[r_bot, c_right] = d3
+        mad.lo.s32  %r50, r_bot, %r2, c_right;
+        mul.wide.s32 off, %r50, 4;
+        add.s64     addr, %rd3, off;
+        setp.lt.s32 %p6, c_right, %r2;
+        and.pred    p_in, %p5, %p6;
+        @p_in st.global.b32 [addr], %d3;
+    }
+
+    ret;
+}

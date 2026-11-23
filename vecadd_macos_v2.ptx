@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// vecadd_macos_v2 — host-paced base-offset variant of vecadd_macos.
+// Indexing uses base + tid.x only (single block per launch); avoids the
+// TinyGPU+tinygrad launch-geometry SR zeroing bug (PROOF §8.30/§8.43).
+//
+// Signature:
+//   extern "C" __global__ void vecadd_macos_v2(
+//       float *a, float *b, float *c, int N, int base);
+// Indexing: i = base + threadIdx.x; if (i < N) c[i] = a[i] + b[i];
+//
+
+.version 8.7
+.target sm_120
+.address_size 64
+
+	// .globl	vecadd_macos_v2
+.visible .entry vecadd_macos_v2(
+	.param .u64 .ptr .align 1 vecadd_macos_v2_param_0,
+	.param .u64 .ptr .align 1 vecadd_macos_v2_param_1,
+	.param .u64 .ptr .align 1 vecadd_macos_v2_param_2,
+	.param .u32 vecadd_macos_v2_param_3,
+	.param .u32 vecadd_macos_v2_param_4
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<10>;
+	.reg .b64 	%rd<11>;
+
+// %bb.0:
+	ld.param.b64 	%rd4, [vecadd_macos_v2_param_0];
+	ld.param.b64 	%rd5, [vecadd_macos_v2_param_2];
+	cvta.to.global.u64 	%rd6, %rd5;
+	ld.param.b64 	%rd7, [vecadd_macos_v2_param_1];
+	cvta.to.global.u64 	%rd8, %rd7;
+	cvta.to.global.u64 	%rd9, %rd4;
+	ld.param.b32 	%r1, [vecadd_macos_v2_param_3];
+	ld.param.b32 	%r9, [vecadd_macos_v2_param_4];
+	mov.u32 	%r4, %tid.x;
+	add.s32 	%r5, %r9, %r4;
+	setp.ge.s32 	%p1, %r5, %r1;
+	@%p1 bra 	$L__BB0_2;
+// %bb.1:
+	mul.wide.s32 	%rd10, %r5, 4;
+	add.s64 	%rd1, %rd6, %rd10;
+	add.s64 	%rd2, %rd8, %rd10;
+	add.s64 	%rd3, %rd9, %rd10;
+	ld.global.b32 	%r6, [%rd3];
+	ld.global.b32 	%r7, [%rd2];
+	add.f32 	%r8, %r6, %r7;
+	st.global.b32 	[%rd1], %r8;
+$L__BB0_2:
+	ret;
+}
