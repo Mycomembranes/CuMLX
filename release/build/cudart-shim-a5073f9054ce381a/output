@@ -1,0 +1,2 @@
+cargo:rerun-if-changed=/Users/mukshudahamed/Documents/cuda-oxide-main/target/release/deps/libcuda_driverkit.dylib
+cargo:rustc-cdylib-link-arg=-Wl,-reexport_library,/Users/mukshudahamed/Documents/cuda-oxide-main/target/release/deps/libcuda_driverkit.dylib
