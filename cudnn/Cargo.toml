@@ -1,0 +1,15 @@
+[package]
+name = "cudnn-stub"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "macOS arm64e link-stub for libcudnn.dylib (MLX CUDA backend). Honest no-op: every fn returns CUDNN_STATUS_NOT_SUPPORTED."
+
+# cdylib named `cudnn` so the linker emits `libcudnn.dylib` — the exact name
+# CMake's find_package(CUDAToolkit)/find_package(cuDNN) links.
+[lib]
+name = "cudnn"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+cc = "1"
