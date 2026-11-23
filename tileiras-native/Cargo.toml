@@ -1,0 +1,21 @@
+[package]
+name = "tileiras-native"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Pinned-input ELF load planning plus an isolated macOS arm64 worker for NVIDIA tileiras"
+
+[workspace]
+
+[[bin]]
+name = "tileiras-native"
+path = "src/main.rs"
+
+# The only process that ever executes NVIDIA code (see src/bin/tileiras-native-helper/main.rs).
+[[bin]]
+name = "tileiras-native-helper"
+path = "src/bin/tileiras-native-helper/main.rs"
+
+[dependencies]
+binary-ko-loader = { path = "../binary-ko-loader" }
